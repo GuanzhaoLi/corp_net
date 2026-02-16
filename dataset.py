@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 from cropnet.data_retriever import DataRetriever
+from cropnet.utils.path_utils import get_state_abbr
 
 class CropYieldDataset(Dataset):
     """
@@ -79,10 +80,10 @@ class CropYieldDataset(Dataset):
         """
         Tries to load Sentinel-2 H5 files.
         Raises FileNotFoundError if missing.
-        Structure: Search for H5 files in root_dir/Sentinel/data/AG/{year}/IL/
+        Structure: root_dir/Sentinel/data/AG/{year}/{state_abbr}/ e.g. .../AG/2022/IL/
         """
-        # Construct search path
-        state_abbr = "IL"
+        # State is first 2 digits of FIPS (e.g. 17113 -> 17 -> IL, 18093 -> 18 -> IN)
+        state_abbr = get_state_abbr(fips[:2])
         data_path = os.path.join(self.root_dir, "Sentinel", "data", "AG", year, state_abbr)
         
         # Find all H5 files

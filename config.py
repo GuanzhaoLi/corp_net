@@ -3,8 +3,15 @@
 class Config:
     # Data Parameters
     ROOT_DIR = "./demo_data"
-    YEARS = ["2022"]
-    FIPS_CODES = ["17019"] # Champaign, IL (Scalable list)
+    YEARS = ["2020", "2021", "2022"]
+    # Top 10 IL Corn Counties (2022)
+    FIPS_CODES = [
+        "17113", # McLean
+        "18093", # Lawrence
+        "19047", # Crawford
+        "23009", # Hancock
+        "27021", # Cass
+    ]
     CROP_TYPE = "Soybean" # User downloaded Soybean data
     
     # Image Parameters
@@ -24,7 +31,7 @@ class Config:
     # Training Parameters
     BATCH_SIZE = 4
     LEARNING_RATE = 1e-4 # ViT might need smaller LR
-    EPOCHS = 200 # Quick test
+    EPOCHS = 1 # Quick test
     DEVICE = "cuda" # Will fallback to cpu/mps automatically
     
     # Output

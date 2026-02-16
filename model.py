@@ -60,19 +60,26 @@ class TemporalTransformerEncoder(nn.Module):
         # Classification token for temporal aggregation (Optional, or just use Average/Last)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         
-    def forward(self, x):
-        # x: (B, T, D)
+    def forward(self, x, key_padding_mask=None):
+        # x: (B, T, D). key_padding_mask: (B, T) True = ignore (e.g. padded)
         B, T, D = x.shape
         
         # Prepend CLS token
         cls_tokens = self.cls_token.expand(B, -1, -1) # (B, 1, D)
         x = torch.cat((cls_tokens, x), dim=1) # (B, T+1, D)
         
+        # Mask for transformer: (B, T+1), True = ignore. CLS at 0 is never masked.
+        if key_padding_mask is not None:
+            # key_padding_mask is (B, T) for sequence; prepend False for CLS
+            pad_mask = torch.cat([torch.zeros(B, 1, dtype=torch.bool, device=x.device), key_padding_mask], dim=1)
+        else:
+            pad_mask = None
+        
         # Add Positional Encoding
         x = self.pos_encoder(x)
         
         # Transformer Pass
-        out = self.transformer_encoder(x) # (B, T+1, D)
+        out = self.transformer_encoder(x, src_key_padding_mask=pad_mask) # (B, T+1, D)
         
         # Use CLS token output for prediction
         return out[:, 0, :]
@@ -100,12 +107,11 @@ class CropYieldModel(nn.Module):
             nn.Linear(64, 1) # Yield Prediction
         )
         
-    def forward(self, x):
-        # x: (B, T, C, H, W)
+    def forward(self, x, lengths=None):
+        # x: (B, T, C, H, W). lengths: (B,) actual time steps per sample (optional, for variable T)
         B, T, C, H, W = x.shape
         
         # Flatten B and T to pass through Visual Encoder
-        # Use reshape to handle non-contiguous memory safely
         x_flat = x.contiguous().reshape(B * T, C, H, W)
         
         # Visual Feats (Spatial ViT)
@@ -114,8 +120,15 @@ class CropYieldModel(nn.Module):
         # Reshape back to Sequence
         visual_feats = visual_feats.reshape(B, T, -1) # (B, T, D)
         
+        # Mask for padded time steps (True = ignore)
+        if lengths is not None:
+            # lengths: (B,) e.g. [12, 10, 15, 12]; mask[b, t] = True when t >= lengths[b]
+            key_padding_mask = torch.arange(T, device=x.device).unsqueeze(0) >= lengths.unsqueeze(1)  # (B, T)
+        else:
+            key_padding_mask = None
+        
         # Temporal Processing (Temporal Transformer)
-        context_vec = self.temporal_encoder(visual_feats) # (B, D)
+        context_vec = self.temporal_encoder(visual_feats, key_padding_mask=key_padding_mask) # (B, D)
         
         # Prediction
         prediction = self.head(context_vec) # (B, 1)
