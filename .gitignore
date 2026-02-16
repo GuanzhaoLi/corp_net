@@ -1,0 +1,7 @@
+.idea
+.demo_data/*
+.DS_Store
+__pycache__
+demo_data/*
+Lin_MMST-ViT_Climate_Change-aware_Crop_Yield_Prediction_via_Multi-Modal_Spatial-Temporal_Vision_ICCV_2023_paper.pdf
+checkpoints/model_latest.pth
