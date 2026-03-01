@@ -5,3 +5,15 @@ __pycache__
 demo_data/*
 Lin_MMST-ViT_Climate_Change-aware_Crop_Yield_Prediction_via_Multi-Modal_Spatial-Temporal_Vision_ICCV_2023_paper.pdf
 checkpoints/model_latest.pth
+.checkpoints_quick
+.checkpoints
+*.csv
+README_US_ESTIMATE.md
+GIT_ON_EC2.md
+*.log
+.venv/*
+checkpoints/*
+checkpoints_quick/*
+.vscode/*
+CORN_FUTURES_PIPELINE_FLOW.md
+corn_futures_model.ipynb

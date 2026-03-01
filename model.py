@@ -101,10 +101,15 @@ class CropYieldModel(nn.Module):
             dropout=config.DROPOUT
         )
         
+        # Stronger head with dropout to force use of features and reduce constant collapse
         self.head = nn.Sequential(
-            nn.Linear(config.HIDDEN_DIM, 64),
+            nn.Linear(config.HIDDEN_DIM, 256),
             nn.ReLU(),
-            nn.Linear(64, 1) # Yield Prediction
+            nn.Dropout(0.2),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Dropout(config.DROPOUT),
+            nn.Linear(64, 1),
         )
         
     def forward(self, x, lengths=None):
