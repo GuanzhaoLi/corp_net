@@ -68,20 +68,20 @@ class Qwen2VLYieldModel(nn.Module):
                 pixel_values.to(self.device, dtype=self.dtype),
                 image_grid_thw.to(self.device),
             )
-        # vision_outputs: (total_tokens, hidden_size)
-        # Split by image using image_grid_thw. Merger does spatial_merge_size=2 -> 4 patches -> 1 token.
-        grid = image_grid_thw.cpu()
+        # vision_outputs: (total_tokens, hidden_size). Split by image via image_grid_thw.
+        grid = image_grid_thw.cpu().numpy() if image_grid_thw.dim() > 1 else image_grid_thw.cpu().unsqueeze(0).numpy()
+        if grid.ndim == 1:
+            grid = grid.reshape(-1, 3)
         n_images = grid.shape[0]
-        tokens_per_image = (grid[:, 0] * (grid[:, 1] // 2) * (grid[:, 2] // 2)).tolist()
-        if sum(tokens_per_image) != vision_outputs.shape[0]:
-            tokens_per_image = (grid[:, 0] * grid[:, 1] * grid[:, 2]).tolist()
-            # try no merge div
-            if sum(tokens_per_image) != vision_outputs.shape[0]:
-                tokens_per_image = [vision_outputs.shape[0] // n_images] * n_images
+        merge = getattr(self.vlm.model.visual, "spatial_merge_size", 2)
+        tokens_per_image = (grid[:, 0] * (grid[:, 1] // merge) * (grid[:, 2] // merge)).astype(int).tolist()
+        total = sum(tokens_per_image)
+        if total != vision_outputs.shape[0]:
+            tokens_per_image = [vision_outputs.shape[0] // max(1, n_images)] * n_images
         start = 0
         feats = []
         for L in tokens_per_image:
-            end = start + L
+            end = min(start + L, vision_outputs.shape[0])
             feats.append(vision_outputs[start:end].mean(dim=0))
             start = end
         return torch.stack(feats, dim=0)
@@ -94,8 +94,7 @@ class Qwen2VLYieldModel(nn.Module):
         assert T == self.num_frames
         images_flat = images.reshape(B * T, C, H, W)
         list_imgs = self._images_to_processor_input(images_flat)
-        # Processor: list of images -> pixel_values, image_grid_thw
-        from transformers.image_utils import to_numpy_array
+        # Use image processor: images 0-255, return pixel_values + image_grid_thw
         processed = self.processor.image_processor.preprocess(
             list_imgs,
             return_tensors="pt",
@@ -103,10 +102,14 @@ class Qwen2VLYieldModel(nn.Module):
             do_normalize=True,
         )
         pixel_values = processed["pixel_values"].to(self.device, dtype=self.dtype)
-        image_grid_thw = processed["image_grid_thw"].to(self.device)
-        # (B*5, hidden_size)
+        image_grid_thw = processed["image_grid_thw"]
+        if not isinstance(image_grid_thw, torch.Tensor):
+            image_grid_thw = torch.tensor(image_grid_thw, device=self.device, dtype=torch.long)
+        else:
+            image_grid_thw = image_grid_thw.to(self.device)
+        if image_grid_thw.dim() == 1:
+            image_grid_thw = image_grid_thw.unsqueeze(0)
         feats = self._get_vision_features(pixel_values, image_grid_thw)
-        # (B, 5, hidden_size) -> (B, hidden_size)
         feats = feats.reshape(B, T, -1).mean(dim=1)
         out = self.head(feats.float()).squeeze(-1)
         if return_features:
