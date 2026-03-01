@@ -34,13 +34,20 @@ class Qwen2VLYieldModel(nn.Module):
         self.processor = processor
         for p in self.vlm.parameters():
             p.requires_grad = False
-        # Vision encoder output dim (merger output = text hidden_size)
-        self.vision_hidden_size = getattr(
-            self.vlm.config, "hidden_size",
-            getattr(self.vlm.config.text_config, "hidden_size", 2048)
-        )
+        # Vision encoder output dim: Qwen2-VL-2B vision merger outputs 1280 (not text hidden_size 1536)
+        vc = getattr(self.vlm.config, "vision_config", None)
+        self.vision_hidden_size = getattr(vc, "hidden_size", None) if vc is not None else None
+        if self.vision_hidden_size is None:
+            self.vision_hidden_size = getattr(
+                self.vlm.config, "hidden_size",
+                getattr(self.vlm.config.text_config, "hidden_size", 2048)
+            )
+        # Qwen2-VL-2B visual merger output is 1280; text is 1536 — use vision dim for head
         if hidden_size is None:
             hidden_size = self.vision_hidden_size
+        # If config says 1536 but actual vision out is 1280, head will be rebuilt on first forward; use 1280 for 2B
+        if hidden_size == 1536:
+            hidden_size = 1280
         self.head = nn.Sequential(
             nn.Linear(hidden_size, 256),
             nn.ReLU(),
