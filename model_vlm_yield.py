@@ -21,12 +21,14 @@ def _load_qwen2vl_components(device, dtype=torch.float32):
 
 class Qwen2VLYieldModel(nn.Module):
     """
-    Freeze Qwen2-VL, use vision encoder output -> mean over 5 images -> regression head -> yield.
+    Freeze Qwen2-VL, use vision encoder output -> [optional temporal encoder] -> pool over 5 images -> regression head -> yield.
+    use_temporal=True: 1-layer Transformer over 5 frame features so the model can learn temporal patterns instead of just mean.
     Input: batch of (B, 5, 3, H, W) images in [0, 1], float32.
     """
-    def __init__(self, num_frames=5, hidden_size=None, dropout=0.1, device=None, dtype=torch.float32):
+    def __init__(self, num_frames=5, hidden_size=None, dropout=0.1, device=None, dtype=torch.float32, use_temporal=False):
         super().__init__()
         self.num_frames = num_frames
+        self.use_temporal = use_temporal
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         model, processor = _load_qwen2vl_components(self.device, dtype)
@@ -48,6 +50,20 @@ class Qwen2VLYieldModel(nn.Module):
         # If config says 1536 but actual vision out is 1280, head will be rebuilt on first forward; use 1280 for 2B
         if hidden_size == 1536:
             hidden_size = 1280
+        self._hidden_size = hidden_size
+        # Optional: 1-layer Transformer over (B, T, D) so model can use temporal pattern, not just mean
+        self.temporal_encoder = None
+        if use_temporal:
+            self.temporal_encoder = nn.TransformerEncoderLayer(
+                d_model=hidden_size,
+                nhead=8,
+                dim_feedforward=512,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=False,
+            )
+            self.temporal_encoder = self.temporal_encoder.to(self.device, dtype=torch.float32)
         self.head = nn.Sequential(
             nn.Linear(hidden_size, 256),
             nn.ReLU(),
@@ -124,13 +140,16 @@ class Qwen2VLYieldModel(nn.Module):
         if image_grid_thw.dim() == 1:
             image_grid_thw = image_grid_thw.unsqueeze(0)
         feats = self._get_vision_features(pixel_values, image_grid_thw)
-        feats = feats.reshape(B, T, -1).mean(dim=1)
-        out = self.head(feats.float()).squeeze(-1)
+        feats = feats.reshape(B, T, -1).float()
+        if self.temporal_encoder is not None:
+            feats = self.temporal_encoder(feats)
+        feats = feats.mean(dim=1)
+        out = self.head(feats).squeeze(-1)
         if return_features:
             return out, feats
         return out
 
 
-def build_vlm_yield_model(num_frames=5, dropout=0.1, device=None):
+def build_vlm_yield_model(num_frames=5, dropout=0.1, device=None, use_temporal=False):
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return Qwen2VLYieldModel(num_frames=num_frames, dropout=dropout, device=device)
+    return Qwen2VLYieldModel(num_frames=num_frames, dropout=dropout, device=device, use_temporal=use_temporal)

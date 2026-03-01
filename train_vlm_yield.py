@@ -25,6 +25,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=2, help="Small batch: VLM is heavy")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--normalize-target", action="store_true")
+    parser.add_argument("--temporal", action="store_true", help="Use 1-layer Transformer over 5 frames to learn temporal pattern (may reduce mean collapse)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -48,13 +49,18 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    print("Loading Qwen2-VL-2B + regression head (vision frozen)...")
-    model = build_vlm_yield_model(num_frames=5, dropout=0.1, device=device)
+    print("Loading Qwen2-VL-2B + regression head (vision frozen)" + (" + temporal encoder" if args.temporal else "") + "...")
+    model = build_vlm_yield_model(num_frames=5, dropout=0.1, device=device, use_temporal=args.temporal)
+    trainable = list(model.head.parameters())
     for p in model.head.parameters():
         p.requires_grad = True
+    if model.temporal_encoder is not None:
+        for p in model.temporal_encoder.parameters():
+            p.requires_grad = True
+            trainable.append(p)
 
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.head.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(trainable, lr=args.lr)
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     if yield_mean is not None:
@@ -74,7 +80,7 @@ def main():
             pred = model(images)
             loss = criterion(pred, targets)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.head.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             optimizer.step()
             train_losses.append(loss.item())
         avg_train = np.mean(train_losses)
@@ -98,14 +104,20 @@ def main():
                 "head": model.head.state_dict(),
                 "vision_hidden_size": model.vision_hidden_size,
                 "num_frames": model.num_frames,
+                "use_temporal": args.temporal,
             }
+            if model.temporal_encoder is not None:
+                state["temporal_encoder"] = model.temporal_encoder.state_dict()
             torch.save(state, os.path.join(args.checkpoint_dir, "vlm_head_best.pth"))
 
     state = {
         "head": model.head.state_dict(),
         "vision_hidden_size": model.vision_hidden_size,
         "num_frames": model.num_frames,
+        "use_temporal": args.temporal,
     }
+    if model.temporal_encoder is not None:
+        state["temporal_encoder"] = model.temporal_encoder.state_dict()
     torch.save(state, os.path.join(args.checkpoint_dir, "vlm_head_last.pth"))
     print(f"Saved to {args.checkpoint_dir}")
 

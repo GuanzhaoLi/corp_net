@@ -35,9 +35,12 @@ def main():
             yield_mean, yield_std = n["mean"], n["std"]
 
     print("Loading model and head...")
-    model = build_vlm_yield_model(num_frames=len(DEFAULT_FRAME_INDICES), device=device)
-    state = torch.load(args.checkpoint, map_location=device)
+    state = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    use_temporal = state.get("use_temporal", False)
+    model = build_vlm_yield_model(num_frames=len(DEFAULT_FRAME_INDICES), device=device, use_temporal=use_temporal)
     model.head.load_state_dict(state["head"], strict=True)
+    if model.temporal_encoder is not None and "temporal_encoder" in state:
+        model.temporal_encoder.load_state_dict(state["temporal_encoder"], strict=True)
     model.eval()
 
     dataset = VLMYieldDataset(root_dir=args.data_dir)
