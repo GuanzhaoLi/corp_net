@@ -64,10 +64,16 @@ class Qwen2VLYieldModel(nn.Module):
     def _get_vision_features(self, pixel_values, image_grid_thw):
         """Run vision encoder and return one vector per image (mean pool over patches)."""
         with torch.no_grad():
-            vision_outputs = self.vlm.model.visual(
+            out = self.vlm.model.visual(
                 pixel_values.to(self.device, dtype=self.dtype),
                 image_grid_thw.to(self.device),
             )
+        # Output is BaseModelOutputWithPooling; use last_hidden_state or pooler_output
+        vision_outputs = getattr(out, "last_hidden_state", getattr(out, "pooler_output", None))
+        if vision_outputs is None and hasattr(out, "__getitem__"):
+            vision_outputs = out[0]
+        if vision_outputs is None:
+            raise AttributeError("Vision encoder returned no tensor (expected last_hidden_state or pooler_output)")
         # vision_outputs: (total_tokens, hidden_size). Split by image via image_grid_thw.
         grid = image_grid_thw.cpu().numpy() if image_grid_thw.dim() > 1 else image_grid_thw.cpu().unsqueeze(0).numpy()
         if grid.ndim == 1:
@@ -76,12 +82,13 @@ class Qwen2VLYieldModel(nn.Module):
         merge = getattr(self.vlm.model.visual, "spatial_merge_size", 2)
         tokens_per_image = (grid[:, 0] * (grid[:, 1] // merge) * (grid[:, 2] // merge)).astype(int).tolist()
         total = sum(tokens_per_image)
-        if total != vision_outputs.shape[0]:
-            tokens_per_image = [vision_outputs.shape[0] // max(1, n_images)] * n_images
+        seq_len = vision_outputs.shape[0]
+        if total != seq_len:
+            tokens_per_image = [seq_len // max(1, n_images)] * n_images
         start = 0
         feats = []
         for L in tokens_per_image:
-            end = min(start + L, vision_outputs.shape[0])
+            end = min(start + L, seq_len)
             feats.append(vision_outputs[start:end].mean(dim=0))
             start = end
         return torch.stack(feats, dim=0)
