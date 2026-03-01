@@ -17,3 +17,10 @@ checkpoints_quick/*
 .vscode/*
 CORN_FUTURES_PIPELINE_FLOW.md
 corn_futures_model.ipynb
+*.h5
+checkpoints_standalone/*
+VLM_YIELD_BRAINSTORM.md
+STANDALONE_DATA.md
+H5_SIZE_AND_VLM.md
+CROPNET_FRAME_COUNT.md
+BRAINSTORM_LLM.md
