@@ -27,3 +27,5 @@ BRAINSTORM_LLM.md
 README_VLM_YIELD.md
 HANDOVER_AGENT_CONTEXT.md
 checkpoints_vlm/*
+*pth
+checkpoints_vlm_temporal/*
