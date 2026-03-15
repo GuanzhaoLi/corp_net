@@ -1,6 +1,75 @@
 # Corp Net — Soybean Yield Prediction
 
-This repo contains models and scripts for predicting soybean yield from satellite (Sentinel-2) imagery. One path uses a spatio-temporal vision model on H5 time-series; another uses a **vision–language model (Qwen2-VL) as a frozen visual encoder plus a regression head** on standalone H5 data. This README focuses on the latter.
+This repo contains models and scripts for predicting soybean yield from satellite (Sentinel-2) imagery:
+
+- **ViT / standalone**: spatio-temporal vision model (`CropYieldModel`: ViT backbone + temporal Transformer) trained on standalone H5 time-series; then predict → generalize to US totals.
+- **Qwen2-VL**: frozen vision encoder + regression head (and optional temporal encoder) on the same standalone H5 data.
+
+Below: (1) the **ViT/standalone pipeline** (train → predict → US aggregation), then (2) the **Qwen2-VL + regression head** pipeline.
+
+---
+
+## ViT / Standalone Pipeline (ST-ViT)
+
+The **standalone** path uses a hand-built **CropYieldModel** (`model.py`): a per-frame ViT backbone plus a temporal Transformer over the sequence, trained on H5 time-series and `yields.csv`. After training, you **predict** on county–year pairs, then **generalize** to US-level yield/production using NASS acres (and optionally NASS yields for counties you didn’t predict).
+
+### End-to-end flow
+
+```text
+1. Train     → train_standalone.py         → checkpoints_standalone/
+2. Predict   → predict_standalone.py       → predictions_standalone.csv
+3. US total  → generalize_to_us.py       → us_estimates.csv
+```
+
+### 1. Train (ViT)
+
+```bash
+python train_standalone.py \
+  --data-dir ./standalone_data \
+  --checkpoint-dir ./checkpoints_standalone \
+  --normalize-target \
+  --epochs 30
+```
+
+- **Data**: `--data-dir` must contain `yields.csv` (columns `fips`, `year`, and one yield column) and `images/{fips}_{year}.h5` (shape `(T, 3, 224, 224)`).
+- **Output**: `model_best.pth`, `model_last.pth`; if `--normalize-target`, also `yield_norm.json` (for denormalizing at prediction time).
+
+### 2. Predict (ViT)
+
+```bash
+python predict_standalone.py \
+  --data-dir ./standalone_data \
+  --checkpoint ./checkpoints_standalone/model_best.pth \
+  --checkpoint-dir ./checkpoints_standalone \
+  --normalize-target \
+  --out predictions_standalone.csv
+```
+
+- Uses all `images/*.h5` (or restrict with `--fips` / `--years`). Writes CSV: `fips`, `year`, `predicted_yield_bu_per_acre`.
+
+### 3. Generalize to US (NASS acres + optional NASS yield)
+
+```bash
+python generalize_to_us.py predictions_standalone.csv Data.csv --method full --out us_estimates.csv
+```
+
+- **Inputs**:
+  - **predictions CSV**: your model output (`fips`, `year`, `predicted_yield_bu_per_acre`).
+  - **Data.csv**: NASS-style file with State ANSI, County ANSI, Year, Data Item (e.g. ACRES HARVESTED, YIELD BU / ACRE), Value.
+- **Methods**:
+  - **`--method sample`**: Area-weighted yield over **your predicted counties only** × US soybean acres (from config or default) → US production.
+  - **`--method full`**: For **every county** in NASS with acres: use your prediction if `(fips, year)` is in your CSV, else NASS yield; then US production = sum(yield × acres), US yield = production / total acres.
+- **Output**: CSV with `year`, `us_yield_bu_per_acre`, `us_production_bu`, and optionally `total_acres` (for `full`).
+
+### ViT pipeline files
+
+| File | Role |
+|------|------|
+| `model.py` | `CropYieldModel`: ViT backbone + temporal Transformer, variable-length sequences. |
+| `dataset_standalone.py` | Loads H5 + yields.csv; `StandaloneCropYieldDataset`, `load_sample_images`. |
+| `train_standalone.py` | Train on standalone data; saves best/last checkpoint and optional `yield_norm.json`. |
+| `predict_standalone.py` | Load checkpoint, run on H5 samples, write predictions CSV. |
+| `generalize_to_us.py` | Combine predictions with NASS Data.csv → US-level yield and production. |
 
 ---
 
@@ -79,4 +148,4 @@ If you see errors related to `pixel_values` / `image_grid_thw` or vision input s
 
 ---
 
-For the main ST-ViT / standalone training and US-level aggregation, see the rest of the repo and `README_US_ESTIMATE.md` (and `README_VLM_YIELD.md` for a Chinese version of this VLM section).
+See also: `README_US_ESTIMATE.md` (US aggregation and NASS setup), `README_VLM_YIELD.md` (Chinese version of the VLM section).

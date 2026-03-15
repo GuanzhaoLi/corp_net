@@ -29,3 +29,4 @@ HANDOVER_AGENT_CONTEXT.md
 checkpoints_vlm/*
 *pth
 checkpoints_vlm_temporal/*
+history.txt
