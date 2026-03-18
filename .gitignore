@@ -30,3 +30,6 @@ checkpoints_vlm/*
 *pth
 checkpoints_vlm_temporal/*
 history.txt
+
+# VSCode settings
+.vscode/

@@ -87,20 +87,20 @@ def extract_one_fips_year(cropnet_root, fips, year, sentinel_subpath=None):
                         continue
                     if "data" not in grp[date_str]:
                         continue
-                    data_np = grp[date_str]["data"][:]
+                    data_np = grp[date_str]["data"][:] # shape: (n_tiles, C, H, W) = (n_tiles, Channel, Height, Width). expected shape is (8, 224, 224, 3) for RGB 8 tiles
                     n_tiles = data_np.shape[0]
-                    img = data_np[n_tiles // 2]
-                    img = img.astype(np.float32) / 255.0
+                    img = data_np[n_tiles // 2] # take center tile as representative for the date
+                    img = img.astype(np.float32) / 255.0 # normalize pixel values that are [0,255] to [0,1]
                     if img.shape[-1] == 3:
-                        img = np.transpose(img, (2, 0, 1))
+                        img = np.transpose(img, (2, 0, 1)) # reorder to (C,H,W) = (Channel, Height, Width). channel: 3 for RGB, 1 for greyscale, etc.
                     time_series.append((date_str, img))
         except Exception:
             continue
     if not time_series:
         return None, None
-    time_series.sort(key=lambda x: x[0])
+    time_series.sort(key=lambda x: x[0]) # sort by date string; assumes date_str is in sortable format like "2020-05-15"
     dates = [x[0] for x in time_series]
-    images = np.stack([x[1] for x in time_series], axis=0).astype(np.float32)
+    images = np.stack([x[1] for x in time_series], axis=0).astype(np.float32) # shape: (T, C, H, W) = (Time, Channel, Height, Width), where time is the number of dates with data for this (fips, year)
     return images, dates
 
 
@@ -153,6 +153,8 @@ def main():
             continue
         out_path = os.path.join(images_dir, f"{fips}_{year}.h5")
         with h5py.File(out_path, "w") as f:
+            # creates HDF5 file with dataset "images" of shape (T,C,H,W) with the time series of satellite images and dataset "dates" of shape (T,) with date string of each image
+            # T is the number of dates with data for this (fips, year), C is the number of channels (e.g. 3 for RGB), H and W are height and width of the images (e.g. 224x224)
             f.create_dataset("images", data=images)
             dt = h5py.special_dtype(vlen=str)
             dset = f.create_dataset("dates", (len(dates),), dtype=dt)
