@@ -61,9 +61,9 @@ def load_sample_images(root_dir, fips, year, image_subdir="images"):
     h5_path = os.path.join(base, f"{fips}_{year}.h5")
     if os.path.isfile(h5_path):
         with h5py.File(h5_path, "r") as f:
-            images = f["images"][:]
+            images = f["images"][:] # pull time series of satellite images; shape: (T, C, H, W) = (Time, Channel, Height, Width), where time is the number of dates with data for this (fips, year)
             if "dates" in f:
-                ds = f["dates"]
+                ds = f["dates"] # pull date strings for each satellite image in the time series; shape: (T,)
                 if hasattr(ds, "asstr"):
                     dates = [str(ds[i]) for i in range(ds.shape[0])]
                 else:
@@ -72,9 +72,9 @@ def load_sample_images(root_dir, fips, year, image_subdir="images"):
                 dates = [f"t{i}" for i in range(images.shape[0])]
         # Assume (T, H, W, C) or (T, C, H, W)
         if images.ndim == 4 and images.shape[-1] == 3:
-            images = np.transpose(images, (0, 3, 1, 2))
+            images = np.transpose(images, (0, 3, 1, 2)) # reorder to (T, C, H, W) = (Time, Channel, Height, Width). channel: 3 for RGB, 1 for greyscale, etc.
         if images.dtype != np.float32:
-            images = images.astype(np.float32) / 255.0
+            images = images.astype(np.float32) / 255.0 # normalize pixel values that are [0,255] to [0,1]
         return torch.from_numpy(images).float(), dates
 
     # Option 2: npy + json
@@ -124,6 +124,7 @@ class StandaloneCropYieldDataset(Dataset):
         else:
             raise ValueError(f"CSV must have one of: actual_yield_bu_per_acre, yield_bu_per_acre. Got: {list(df.columns)}")
 
+        # (fips, year) -> yield_bu_per_acre (per yield_col) - for fips/year that have valid yield in yields_csv_name CSV
         self.yield_lookup = {}
         for _, row in df.iterrows():
             f = row.get("fips")
@@ -136,6 +137,8 @@ class StandaloneCropYieldDataset(Dataset):
             if pd.notna(val):
                 self.yield_lookup[(f, y)] = float(val)
 
+        # list of {"fips": fips, "year": year} that have both yield in yields_csv_name CSV and images in image_subdir
+        # this does not load the satellite images, just checks for their existence, so __len__ and __getitem__ only see valid samples with both yield and images.
         self.samples = []
         for (fips, year), _ in self.yield_lookup.items():
             try:
