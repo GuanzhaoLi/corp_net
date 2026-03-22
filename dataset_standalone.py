@@ -13,6 +13,7 @@ import h5py
 import torch
 import numpy as np
 import pandas as pd
+from datetime import datetime
 from torch.utils.data import Dataset
 
 
@@ -96,33 +97,72 @@ def load_sample_images(root_dir, fips, year, image_subdir="images"):
     raise FileNotFoundError(f"No standalone image data for fips={fips} year={year}. Tried {h5_path} and {npy_path}")
 
 
+def convert_monthly_macro_to_yearly(macro_df, crop_price_col, features):
+    if "date" not in macro_df.columns:
+        raise ValueError("Macro Data CSV must have 'date' column for monthly to yearly conversion")
+
+    """Convert monthly macroeconomic data to yearly by taking the mean of each month for each year."""
+    macro_df["year"] = macro_df["date"].map(lambda dt: str(datetime.strptime(dt, "%Y-%m-%d").year))
+
+    # sort macro_df by date to ensure the "last" aggregation for crop price is the crop price of the final month of the year
+    # this assumes that the monthly data is complete or mostly complete, so the last month of the year is a good approximation of the final crop price for that year
+    macro_df = macro_df.sort_values(by='date', key=lambda x: pd.to_datetime(x, format="%Y-%m-%d"))
+
+    # assuming average macro conditions over the year to predict year end crop prices with satellite image time series over the year
+    # thus, take mean of macro features over the year and take the last crop price of the year as the target price for that year since it reflects the final market conditions after all growing season events have unfolded
+    yearly_macro_df = macro_df.groupby("year")[features + [crop_price_col]].agg(
+        {crop_price_col: "last"} | {feat: "mean" for feat in features}
+    )
+    return yearly_macro_df.reset_index(drop=False)
+
+
 class StandaloneCropYieldDataset(Dataset):
     """
     Dataset that reads only from standalone_data/ layout. No cropnet.
     Samples are (fips, year) that have both yields in yields.csv and images in images/.
     """
-    def __init__(self, root_dir, yields_csv_name="yields.csv", image_subdir="images", transform=None):
+    def __init__(
+        self, root_dir, yields_csv_name="yields.csv", image_subdir="images", 
+        macro_data_csv_name="macro_data.csv", macro_features=["crude_oil_usd", "usd_index", "fed_funds_rate", "cpi_yoy", "soybean_corn_ratio"], crop_type="soybean", 
+        transform=None
+    ):
         """
         Args:
             root_dir: e.g. ./standalone_data
             yields_csv_name: CSV under root_dir with fips, year, actual_yield_bu_per_acre (or yield_bu_per_acre)
             image_subdir: subdir under root_dir for images (e.g. "images")
+            macro_data_csv_name: CSV under root_dir with monthly macroeconomic data
+            macro_features: list of macro features to use
+            crop_type: "soybean" or "corn" (crop price to predict)
             transform: optional callable (not used by default; use AugmentWrapperStandalone for train)
         """
         self.root_dir = os.path.abspath(root_dir)
         self.image_subdir = image_subdir
+        self.macro_data_csv_name = macro_data_csv_name
+        self.macro_features = macro_features
+        self.crop_type = crop_type
         self.transform = transform
-        csv_path = os.path.join(self.root_dir, yields_csv_name)
-        if not os.path.isfile(csv_path):
-            raise FileNotFoundError(f"Yields CSV not found: {csv_path}")
 
-        df = pd.read_csv(csv_path)
+        # read in yield_bu_per_acre - yearly yield for each fips
+        yield_csv_path = os.path.join(self.root_dir, yields_csv_name)
+        if not os.path.isfile(yield_csv_path):
+            raise FileNotFoundError(f"Yields CSV not found: {yield_csv_path}")
+
+        df = pd.read_csv(yield_csv_path)
         for col in ("actual_yield_bu_per_acre", "yield_bu_per_acre", "predicted_yield_bu_per_acre"):
             if col in df.columns:
                 yield_col = col
                 break
         else:
             raise ValueError(f"CSV must have one of: actual_yield_bu_per_acre, yield_bu_per_acre. Got: {list(df.columns)}")
+
+        # read in macroeconomic data - monthly crude_oil_usd, usd_index, fed_funds_rate, cpi_yoy, soy_corn_ratio
+        macro_data_path = os.path.join(self.root_dir, self.macro_data_csv_name)
+        if os.path.isfile(macro_data_path):
+            self.raw_macro_data = pd.read_csv(macro_data_path)
+        else:
+            self.raw_macro_data = None
+            raise FileNotFoundError(f"Macro Data CSV not found: {macro_data_path}")
 
         # (fips, year) -> yield_bu_per_acre (per yield_col) - for fips/year that have valid yield in yields_csv_name CSV
         self.yield_lookup = {}
@@ -136,6 +176,25 @@ class StandaloneCropYieldDataset(Dataset):
             val = row.get(yield_col)
             if pd.notna(val):
                 self.yield_lookup[(f, y)] = float(val)
+
+        # check that macro data has the necessary crop price column for the specified crop_type. The column should be "{crop_type}_price", e.g. "soybean_price" or "corn_price".
+        price_col = f"{self.crop_type}_price"
+        if price_col not in self.raw_macro_data.columns:
+            raise ValueError(f"Macro data CSV must have column {price_col} for crop_type={self.crop_type}")
+
+        # convert monthly macro data to yearly -> macro features (crude_oil_usd, usd_index, fed_funds_rate, cpi_yoy, soy_corn_ratio)
+        self.yearly_macro_data = convert_monthly_macro_to_yearly(self.raw_macro_data, crop_price_col=price_col, features=self.macro_features)
+
+        # (year) -> crop price
+        self.crop_price_lookup = {}
+        for _, row in self.yearly_macro_data.iterrows():
+            y = row.get("year")
+            if pd.isna(y):
+                continue
+            y = str(int(y))
+            price = row.get(price_col)
+            if pd.notna(price):
+                self.crop_price_lookup[y] = float(price)
 
         # list of {"fips": fips, "year": year} that have both yield in yields_csv_name CSV and images in image_subdir
         # this does not load the satellite images, just checks for their existence, so __len__ and __getitem__ only see valid samples with both yield and images.

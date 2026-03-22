@@ -25,15 +25,15 @@ def collate_crop_yield(batch):
     images_list = [b["images"] for b in batch]
     max_T = max(im.shape[0] for im in images_list)
     C, H, W = images_list[0].shape[1], images_list[0].shape[2], images_list[0].shape[3]
-    lengths = torch.tensor([im.shape[0] for im in images_list], dtype=torch.long)
+    lengths = torch.tensor([im.shape[0] for im in images_list], dtype=torch.long) # actual time steps per sample before padding; shape: (batch_size,)
     padded = []
     for im in images_list:
         T = im.shape[0]
         if T < max_T:
-            pad = torch.zeros(max_T - T, C, H, W, dtype=im.dtype, device=im.device)
+            pad = torch.zeros(max_T - T, C, H, W, dtype=im.dtype, device=im.device) # pad with zeros for missing time steps since the time series are variable-length; so the resulting shape: (max_T, C, H, W)
             im = torch.cat([im, pad], dim=0)
         padded.append(im)
-    images = torch.stack(padded, dim=0)
+    images = torch.stack(padded, dim=0) # build batch tensor of shape (batch_size, max_T, C, H, W)
     yield_ = torch.cat([b["yield"] for b in batch], dim=0)
     return {
         "images": images,
@@ -47,11 +47,14 @@ def collate_crop_yield(batch):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="./standalone_data", help="Standalone data root (yields.csv + images/)")
+    parser.add_argument("--data-dir", default="./standalone_data", help="Standalone data root (yields.csv + macro_data.csv + images/)")
     parser.add_argument("--checkpoint-dir", default="./checkpoints_standalone", help="Where to save model and yield norm")
     parser.add_argument("--epochs", type=int, default=None, help="Override config EPOCHS")
     parser.add_argument("--normalize-target", action="store_true", help="Z-score normalize yield; save mean/std for prediction")
     parser.add_argument("--yields-csv", default="yields.csv", help="CSV name under data-dir")
+    parser.add_argument("--macro-data-csv", default="macro_data.csv", help="CSV name under data-dir")
+    parser.add_argument("--macro-features", nargs="+", default=["crude_oil_usd", "usd_index", "fed_funds_rate", "cpi_yoy", "soybean_corn_ratio"], help="Subset of macro features to use. E.g. --macro-features crude_oil_usd usd_index fed_funds_rate cpi_yoy soybean_corn_ratio")
+    parser.add_argument("--crop", choices=["soybean", "corn"], help="Crop to model (default: soybean)", default="soybean")
     parser.add_argument("--image-subdir", default="images", help="Subdir under data-dir for H5/npy")
     args = parser.parse_args()
 
@@ -63,10 +66,14 @@ def main():
     )
     print(f"Using device: {device}")
 
+    # initialize the datasets
     full_dataset = StandaloneCropYieldDataset(
         root_dir=args.data_dir,
         yields_csv_name=args.yields_csv,
+        macro_data_csv_name=args.macro_data_csv,
+        macro_features=args.macro_features,
         image_subdir=args.image_subdir,
+        crop_type=args.crop
     )
     if len(full_dataset) == 0:
         raise SystemExit("No samples in standalone dataset. Check data_dir and yields.csv / images/.")
@@ -74,6 +81,9 @@ def main():
     # Optionally compute yield mean/std from full dataset (train+val) for normalization
     yield_mean, yield_std = None, None
     if args.normalize_target:
+        # look up yield for each fips/year in full_dataset.samples, then compute mean/std across all yield for all fips even if there are multiple fips, to get a single global mean/std for normalization
+        # this is done on the full dataset (train+val) to avoid data leakage from val to train, since normalization is a global stat that would be computed before train/val split in a real setting
+        # if we compute mean/std only on train, then the val set may have different distribution and the normalization may be less effective.
         all_y = [full_dataset.yield_lookup[(s["fips"], s["year"])] for s in full_dataset.samples]
         yield_mean = float(np.mean(all_y))
         yield_std = float(np.std(all_y))
@@ -81,6 +91,7 @@ def main():
             yield_std = 1.0
         print(f"Target normalization: mean={yield_mean:.2f}, std={yield_std:.2f}")
 
+    # assume 80-20 train-val split
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
@@ -94,8 +105,8 @@ def main():
     )
 
     model = CropYieldModel(config).to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    criterion = nn.MSELoss() # loss function: mean squared error between predicted yield and actual yield
+    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE) # Adam optimizer with learning rate from config
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     if yield_mean is not None:
