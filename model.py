@@ -139,3 +139,112 @@ class CropYieldModel(nn.Module):
         prediction = self.head(context_vec) # (B, 1)
         
         return prediction.squeeze(-1)
+
+
+class MacroEncoder(nn.Module):
+    """
+    Encodes yearly macroeconomic data (CPI, Interest Rates, Fertilizer Prices, etc.)
+    """
+    def __init__(self, input_dim, hidden_dim, dropout=0.1):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+
+        self.macro_encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim)
+        )
+
+    def forward(self, x):
+        # x: (B, input_dim)
+        return self.macro_encoder(x)
+
+class CropPriceModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        
+        # Visual/Temporal Branch (ViT + Temporal Transformer on satellite image sequence)
+        self.visual_encoder = VisualEncoder(
+            backbone_name=config.VISUAL_BACKBONE,
+            pretrained=True, 
+            out_dim=config.HIDDEN_DIM
+        )
+        
+        self.temporal_encoder = TemporalTransformerEncoder(
+            d_model=config.HIDDEN_DIM,
+            num_layers=config.TEMPORAL_LAYERS,
+            nhead=config.TEMPORAL_HEADS,
+            dropout=config.DROPOUT
+        )
+
+        # Macro Branch
+        self.macro_encoder = MacroEncoder(
+            input_dim=config.MACRO_INPUT_DIM,
+            hidden_dim=config.HIDDEN_DIM,
+            dropout=config.DROPOUT
+        )
+
+        # Gated Fusion Layer
+        # use fusion gate to learn the relative weights of the modalities
+        self.gated_fusion = nn.Sequential(
+            nn.Linear(config.HIDDEN_DIM * 3, config.HIDDEN_DIM),
+            nn.Sigmoid()
+        )
+
+        # Prediction Head
+        self.head = nn.Sequential(
+            nn.Linear(config.HIDDEN_DIM, 256),
+            nn.GELU(),
+            nn.Dropout(config.DROPOUT),
+            nn.Linear(256, 1) # Predicting a single scalar: price basis
+        )
+
+    def forward(self, images, macro_data, lengths=None):
+        """
+        Args:
+            images: (B, T, C, H, W) - Sentinel 2 satellite image sequence
+            macro_data: (B, M) - Yearly aggregated macroeconomic features
+            lengths: (B,) - Actual image sequence lengths for masking
+        """
+        # x: (B, T, C, H, W). lengths: (B,) actual time steps per sample (optional, for variable T)
+        B, T, C, H, W = images.shape
+
+        # Visual/Temporal Branch (ViT + Temporal Transformer on satellite image sequence)
+        # Flatten B and T for the ViT/ResNet backbone
+        images_flat = images.contiguous().reshape(B * T, C, H, W)
+        # Visual Feats (Spatial ViT)
+        visual_feats = self.visual_encoder(images_flat) # (B * T, D)
+        # Reshape back to Sequence
+        visual_feats = visual_feats.reshape(B, T, -1) # (B, T, D)
+        
+        # Mask for padded time steps (True = ignore)
+        if lengths is not None:
+            # lengths: (B,) e.g. [12, 10, 15, 12]; mask[b, t] = True when t >= lengths[b]
+            key_padding_mask = torch.arange(T, device=images.device).unsqueeze(0) >= lengths.unsqueeze(1)  # (B, T)
+        else:
+            key_padding_mask = None
+        
+        # Temporal Processing (Temporal Transformer)
+        context_vec = self.temporal_encoder(visual_feats, key_padding_mask=key_padding_mask) # (B, D)
+
+        # Macro Branch
+        macro_vec = self.macro_encoder(macro_data) # (B, D)
+
+        # Gated Fusion Layer
+        # Concatenate all features
+        combined_vec = torch.cat([context_vec, macro_vec], dim=-1) # (B, D * 2)
+        gate_weight = self.gated_fusion(combined_vec) # (B, D)
+        
+        # Compute an element-wise weight (gate) between 0 and 1
+        # If gate is high, visual features are prioritized; if low, macro is prioritized
+        fused = gate_weight * context_vec + (1 - gate_weight) * macro_vec
+
+        # Prediction
+        price_basis_prediction = self.head(fused) # (B, 1)
+
+        return price_basis_prediction.squeeze(-1)

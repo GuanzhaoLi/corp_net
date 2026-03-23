@@ -113,6 +113,7 @@ def main():
         raise SystemExit("No samples in standalone dataset. Check data_dir and yields.csv / macro_data.csv / images/.")
 
     # Optionally compute yield mean/std from full dataset (train+val) for normalization
+    # TODO: also normalize macro features?
     yield_mean, yield_std = None, None
     price_basis_mean, price_basis_std = None, None
     if args.normalize_target:
