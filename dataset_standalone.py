@@ -185,8 +185,14 @@ class StandaloneCropYieldDataset(Dataset):
         # convert monthly macro data to yearly -> macro features (crude_oil_usd, usd_index, fed_funds_rate, cpi_yoy, soy_corn_ratio)
         self.yearly_macro_data = convert_monthly_macro_to_yearly(self.raw_macro_data, crop_price_col=price_col, features=self.macro_features)
 
-        # (year) -> crop price
+        # crop_price_lookup: raw crop price for the year --- (year) -> crop price
+        # crop_reference_price_lookup: uses the prior year raw crop price as the reference price --- (year) -> reference crop price
+        # used to compute price basis (which will be the prediction target) = ln(price / reference_price) to mitigate long-term trends and focus on predicting the relative price changes due to yearly conditions
+        # price_basis_lookup: (year) -> ln(price / reference_price)
+        # where reference_price is the prior year's price, so price basis reflects the year-over-year change in crop price
         self.crop_price_lookup = {}
+        self.reference_crop_price_lookup = {}
+        self.price_basis_lookup = {}
         for _, row in self.yearly_macro_data.iterrows():
             y = row.get("year")
             if pd.isna(y):
@@ -195,16 +201,34 @@ class StandaloneCropYieldDataset(Dataset):
             price = row.get(price_col)
             if pd.notna(price):
                 self.crop_price_lookup[y] = float(price)
+            
+            prior_y = str(int(y) - 1)
+            if prior_y in self.yearly_macro_data["year"].values:
+                prior_price = self.yearly_macro_data.loc[self.yearly_macro_data["year"] == prior_y, price_col].values[0]
+                if pd.notna(prior_price):
+                    self.reference_crop_price_lookup[y] = float(prior_price)
+                    if price > 0 and prior_price > 0:
+                        self.price_basis_lookup[y] = float(np.log(float(price) / float(prior_price)))
+                    else:
+                        self.price_basis_lookup[y] = np.nan
+                else:
+                    self.reference_crop_price_lookup[y] = np.nan
+                    self.price_basis_lookup[y] = np.nan
+            else:
+                self.reference_crop_price_lookup[y] = np.nan
+                self.price_basis_lookup[y] = np.nan
 
         # list of {"fips": fips, "year": year} that have both yield in yields_csv_name CSV and images in image_subdir
         # this does not load the satellite images, just checks for their existence, so __len__ and __getitem__ only see valid samples with both yield and images.
+        # only include samples that have valid price basis (i.e. both current and prior year crop price are available and > 0) since the price basis will be the prediction target for the model
         self.samples = []
         for (fips, year), _ in self.yield_lookup.items():
-            try:
-                load_sample_images(self.root_dir, fips, year, image_subdir=self.image_subdir)
-                self.samples.append({"fips": fips, "year": year})
-            except FileNotFoundError:
-                continue
+            if year in self.price_basis_lookup and not pd.isna(self.price_basis_lookup[year]):
+                try:
+                    load_sample_images(self.root_dir, fips, year, image_subdir=self.image_subdir)
+                    self.samples.append({"fips": fips, "year": year})
+                except FileNotFoundError:
+                    continue
         print(f"[StandaloneCropYieldDataset] {len(self.samples)} samples from {root_dir} (with both yields and images)")
 
     def __len__(self):
