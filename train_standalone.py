@@ -171,8 +171,8 @@ def main():
             if price_basis_mean is not None:
                 targets = (targets - price_basis_mean) / price_basis_std
             optimizer.zero_grad()
-            outputs = model(images, macro=macro, lengths=lengths)
-            loss = criterion(outputs, targets)
+            outputs = model(images=images, macro=macro, lengths=lengths)
+            loss = criterion(outputs, target=targets)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), getattr(config, "GRAD_CLIP", 1.0))
             optimizer.step()
@@ -189,8 +189,8 @@ def main():
                 lengths = batch["lengths"].to(device)
                 if price_basis_mean is not None:
                     targets = (targets - price_basis_mean) / price_basis_std
-                outputs = model(images, macro=macro, lengths=lengths)
-                val_losses.append(criterion(outputs, targets).item())
+                outputs = model(images=images, macro=macro, lengths=lengths)
+                val_losses.append(criterion(outputs, target=targets).item())
         avg_val = np.mean(val_losses) if val_losses else 0.0
         print(f"Epoch [{epoch+1}/{config.EPOCHS}] Train Loss: {avg_train:.4f}, Val Loss: {avg_val:.4f}")
 
