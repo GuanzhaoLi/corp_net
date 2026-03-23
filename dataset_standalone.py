@@ -239,9 +239,13 @@ class StandaloneCropYieldDataset(Dataset):
         fips, year = info["fips"], info["year"]
         images, dates = load_sample_images(self.root_dir, fips, year, image_subdir=self.image_subdir)
         y = self.yield_lookup[(fips, year)]
+        pb = self.price_basis_lookup[year]
+        macro = self.yearly_macro_data.loc[self.yearly_macro_data["year"] == year, self.macro_features].values[0]
         return {
             "images": images,
+            "macro": torch.tensor(macro, dtype=torch.float32),
             "yield": torch.tensor([y], dtype=torch.float32),
+            "price_basis": torch.tensor([pb], dtype=torch.float32),
             "fips": fips,
             "year": year,
             "dates": dates,
