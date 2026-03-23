@@ -59,6 +59,9 @@ class Config:
     TEMPORAL_LAYERS = 2
     TEMPORAL_HEADS = 4
     DROPOUT = 0.1
+
+    # Macroeconomic data parameters
+    MACRO_INPUT_DIM = 5  # default macro-features: crude_oil_usd, usd_index, fed_funds_rate, cpi_yoy, soy_corn_ratio
     
     # Training Parameters
     BATCH_SIZE = 4

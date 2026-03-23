@@ -95,6 +95,10 @@ def main():
     config = Config()
     if args.epochs is not None:
         config.EPOCHS = args.epochs
+
+    if len(args.macro_features) != config.MACRO_INPUT_DIM:
+        config.MACRO_INPUT_DIM = len(args.macro_features)
+
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     )
