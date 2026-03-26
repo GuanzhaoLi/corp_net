@@ -189,11 +189,10 @@ class CropPriceModel(nn.Module):
             dropout=config.DROPOUT
         )
 
-        # Gated Fusion Layer
-        # use fusion gate to learn the relative weights of the modalities
+        # Gated Fusion Layer: concat visual + macro (2 * D) -> per-dim gate in [0, 1]
         self.gated_fusion = nn.Sequential(
-            nn.Linear(config.HIDDEN_DIM * 3, config.HIDDEN_DIM),
-            nn.Sigmoid()
+            nn.Linear(config.HIDDEN_DIM * 2, config.HIDDEN_DIM),
+            nn.Sigmoid(),
         )
 
         # Prediction Head
