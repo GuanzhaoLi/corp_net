@@ -97,6 +97,34 @@ def load_sample_images(root_dir, fips, year, image_subdir="images"):
     raise FileNotFoundError(f"No standalone image data for fips={fips} year={year}. Tried {h5_path} and {npy_path}")
 
 
+def load_macro_vector_for_year(
+    root_dir,
+    year,
+    macro_features,
+    macro_data_csv_name="macro_data.csv",
+    crop_type="soybean",
+):
+    """
+    Same yearly macro row as StandaloneCropYieldDataset (for inference with CropPriceModel).
+    Returns (macro_tensor,). Raises if year is missing from aggregated macro table.
+    """
+    macro_path = os.path.join(os.path.abspath(root_dir), macro_data_csv_name)
+    if not os.path.isfile(macro_path):
+        raise FileNotFoundError(f"Macro CSV not found: {macro_path}")
+    price_col = f"{crop_type}_price"
+    macro_df = pd.read_csv(macro_path)
+    if price_col not in macro_df.columns:
+        raise ValueError(f"Macro data CSV must have column {price_col} for crop_type={crop_type}")
+    yearly = convert_monthly_macro_to_yearly(macro_df, crop_price_col=price_col, features=list(macro_features))
+    ykey = str(int(year))
+    yr = yearly["year"].astype(str)
+    row = yearly.loc[yr == ykey, list(macro_features)]
+    if row.empty:
+        raise KeyError(f"No macro row for year={ykey} in {macro_path} (after yearly aggregation)")
+    vec = row.values[0].astype(np.float32)
+    return torch.from_numpy(vec)
+
+
 def convert_monthly_macro_to_yearly(macro_df, crop_price_col, features):
     if "date" not in macro_df.columns:
         raise ValueError("Macro Data CSV must have 'date' column for monthly to yearly conversion")
