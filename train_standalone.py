@@ -165,6 +165,7 @@ def main():
             json.dump({"mean": price_basis_mean, "std": price_basis_std}, f)
 
     best_val_loss = float("inf")
+    history_train, history_val = [], []
     for epoch in range(config.EPOCHS):
         model.train()
         batch_losses = []
@@ -197,6 +198,8 @@ def main():
                 outputs = model(images=images, macro_data=macro, lengths=lengths)
                 val_losses.append(criterion(outputs, target=targets).item())
         avg_val = np.mean(val_losses) if val_losses else 0.0
+        history_train.append(float(avg_train))
+        history_val.append(float(avg_val))
         print(f"Epoch [{epoch+1}/{config.EPOCHS}] Train Loss: {avg_train:.4f}, Val Loss: {avg_val:.4f}")
 
         if avg_val < best_val_loss:
@@ -204,6 +207,8 @@ def main():
             torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "model_best.pth"))
 
     torch.save(model.state_dict(), os.path.join(args.checkpoint_dir, "model_last.pth"))
+    with open(os.path.join(args.checkpoint_dir, "training_history.json"), "w") as f:
+        json.dump({"train_loss": history_train, "val_loss": history_val}, f, indent=2)
     print(f"Saved to {args.checkpoint_dir}. Use predict_standalone.py with --checkpoint-dir and (if used) same --normalize-target.")
 
 
