@@ -1,0 +1,28 @@
+flowchart TB
+    subgraph YOUR_MODULE["Vision-based Prediction"]
+        S2[Sentinel-2 H5]
+        S2 --> PB["Spatial Temporal ViT"]
+        S2 --> QW["Qwen + Regression (yield)"]
+        S2 --> QWP["Qwen + macro + fusion (price basis)"]
+        PB --> BPCSV["Soybean Yield per County per Year"]
+        QW --> QWOUT["Qwen yield output"]
+        BPCSV --> AGG[Aggregator to Entire U.S]
+        QWOUT --> AGG
+        AGG --> USY["US Soybean yield per year"]
+    end
+
+    subgraph TEAMMATE["Fusion Part"]
+        NASS[USDA NASS API]
+        YF[yfinance]
+        EIA[EIA Crude Oil]
+        FRED[FRED Dollar/Interest Rates/CPI]
+        NASS --> COLLECT[Combine Data Sources]
+        YF --> COLLECT
+        EIA --> COLLECT
+        FRED --> COLLECT
+        USY --> MERGE["Merge with Predicted Yield"]
+        COLLECT --> MERGE
+        MERGE --> FEAT["Feature Engineering"]
+        FEAT --> MODELS["Ridge / RF / GBM"]
+        MODELS --> OUT["Forecast on Pirces, Trend, Chats"]
+    end

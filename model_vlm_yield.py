@@ -149,7 +149,107 @@ class Qwen2VLYieldModel(nn.Module):
             return out, feats
         return out
 
+    def encode_images(self, images):
+        """
+        images: (B, T, C, H, W) float [0, 1]
+        Returns pooled vision vector (B, hidden_size) on self.device, float32.
+        """
+        B, T, C, H, W = images.shape
+        assert T == self.num_frames
+        images_flat = images.reshape(B * T, C, H, W)
+        list_imgs = self._images_to_processor_input(images_flat)
+        processed = self.processor.image_processor.preprocess(
+            list_imgs,
+            return_tensors="pt",
+            do_rescale=True,
+            do_normalize=True,
+        )
+        pixel_values = processed["pixel_values"].to(self.device, dtype=self.dtype)
+        image_grid_thw = processed["image_grid_thw"]
+        if not isinstance(image_grid_thw, torch.Tensor):
+            image_grid_thw = torch.tensor(image_grid_thw, device=self.device, dtype=torch.long)
+        else:
+            image_grid_thw = image_grid_thw.to(self.device)
+        if image_grid_thw.dim() == 1:
+            image_grid_thw = image_grid_thw.unsqueeze(0)
+        feats = self._get_vision_features(pixel_values, image_grid_thw)
+        feats = feats.reshape(B, T, -1).float()
+        if self.temporal_encoder is not None:
+            feats = self.temporal_encoder(feats)
+        return feats.mean(dim=1)
+
+
+class Qwen2VLPriceModel(Qwen2VLYieldModel):
+    """
+    Same frozen Qwen2-VL vision backbone as yield route, plus MacroEncoder and gated fusion
+    (aligned with CropPriceModel) to predict price basis.
+    Train: macro_encoder, gated_fusion, price_head, optional temporal_encoder (vision frozen).
+    """
+
+    def __init__(
+        self,
+        macro_input_dim,
+        num_frames=5,
+        hidden_size=None,
+        dropout=0.1,
+        device=None,
+        dtype=torch.float32,
+        use_temporal=False,
+    ):
+        super().__init__(
+            num_frames=num_frames,
+            hidden_size=hidden_size,
+            dropout=dropout,
+            device=device,
+            dtype=dtype,
+            use_temporal=use_temporal,
+        )
+        from model import MacroEncoder
+
+        d = self._hidden_size
+        self.macro_encoder = MacroEncoder(
+            input_dim=macro_input_dim,
+            hidden_dim=d,
+            dropout=dropout,
+        ).to(self.device, dtype=torch.float32)
+        self.gated_fusion = nn.Sequential(
+            nn.Linear(d * 2, d),
+            nn.Sigmoid(),
+        ).to(self.device, dtype=torch.float32)
+        self.price_head = nn.Sequential(
+            nn.Linear(d, 256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 1),
+        ).to(self.device, dtype=torch.float32)
+        for p in self.head.parameters():
+            p.requires_grad = False
+
+    def forward(self, images, macro_data):
+        """
+        images: (B, T, C, H, W) on any device (moved inside encode_images path via processor)
+        macro_data: (B, macro_input_dim) float
+        """
+        images_device = images.to(self.device)
+        context_vec = self.encode_images(images_device)
+        macro_vec = self.macro_encoder(macro_data.to(self.device, dtype=torch.float32))
+        combined = torch.cat([context_vec, macro_vec], dim=-1)
+        gate = self.gated_fusion(combined)
+        fused = gate * context_vec + (1.0 - gate) * macro_vec
+        return self.price_head(fused).squeeze(-1)
+
 
 def build_vlm_yield_model(num_frames=5, dropout=0.1, device=None, use_temporal=False):
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return Qwen2VLYieldModel(num_frames=num_frames, dropout=dropout, device=device, use_temporal=use_temporal)
+
+
+def build_vlm_price_model(macro_input_dim, num_frames=5, dropout=0.1, device=None, use_temporal=False):
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return Qwen2VLPriceModel(
+        macro_input_dim=macro_input_dim,
+        num_frames=num_frames,
+        dropout=dropout,
+        device=device,
+        use_temporal=use_temporal,
+    )

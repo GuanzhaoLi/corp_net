@@ -1,15 +1,16 @@
 """
 Dataset for VLM yield (Route B): load standalone H5, subsample 5 key frames per (fips, year).
 Returns (images [5, 3, 224, 224], yield). No cropnet dependency.
+
+VLMPriceDataset: same 5 frames + yearly macro + price_basis target (for Qwen2VLPriceModel).
 """
 import os
-import h5py
 import numpy as np
 import torch
 import pandas as pd
 from torch.utils.data import Dataset
 
-from dataset_standalone import load_sample_images
+from dataset_standalone import StandaloneCropYieldDataset, load_sample_images
 
 # Default: 5 frames evenly over 24 (indices 0, 6, 12, 18, 23)
 DEFAULT_FRAME_INDICES = [0, 6, 12, 18, 23]
@@ -70,6 +71,81 @@ class VLMYieldDataset(Dataset):
         return {
             "images": sub,
             "yield": torch.tensor([y], dtype=torch.float32),
+            "fips": fips,
+            "year": year,
+        }
+
+
+class VLMPriceDataset(Dataset):
+    """
+    Same subsampled 5 frames as VLMYieldDataset, plus macro vector and price_basis target.
+    Reuses StandaloneCropYieldDataset for macro/price_basis/yield CSV logic (needs macro_data.csv).
+    """
+
+    def __init__(
+        self,
+        root_dir,
+        yields_csv_name="yields.csv",
+        macro_data_csv_name="macro_data.csv",
+        macro_features=None,
+        image_subdir="images",
+        crop_type="soybean",
+        frame_indices=None,
+    ):
+        macro_features = macro_features or [
+            "crude_oil_usd",
+            "usd_index",
+            "fed_funds_rate",
+            "cpi_yoy",
+            "soybean_corn_ratio",
+        ]
+        self.frame_indices = frame_indices or list(DEFAULT_FRAME_INDICES)
+        self.base = StandaloneCropYieldDataset(
+            root_dir=root_dir,
+            yields_csv_name=yields_csv_name,
+            macro_data_csv_name=macro_data_csv_name,
+            macro_features=macro_features,
+            image_subdir=image_subdir,
+            crop_type=crop_type,
+        )
+        self.root_dir = self.base.root_dir
+        self.image_subdir = self.base.image_subdir
+        self.macro_features = self.base.macro_features
+        self.price_basis_lookup = self.base.price_basis_lookup
+        self.yearly_macro_data = self.base.yearly_macro_data
+
+        self.samples = []
+        for s in self.base.samples:
+            fips, year = s["fips"], s["year"]
+            try:
+                images, _ = load_sample_images(self.root_dir, fips, year, image_subdir=self.image_subdir)
+            except FileNotFoundError:
+                continue
+            if max(self.frame_indices) >= images.shape[0]:
+                continue
+            self.samples.append({"fips": fips, "year": year})
+        print(
+            f"[VLMPriceDataset] {len(self.samples)} samples, {len(self.frame_indices)} frames "
+            f"(macro_dim={len(self.macro_features)})"
+        )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        info = self.samples[idx]
+        fips, year = info["fips"], info["year"]
+        images, _ = load_sample_images(self.root_dir, fips, year, image_subdir=self.image_subdir)
+        sub = images[self.frame_indices]
+        if not isinstance(sub, torch.Tensor):
+            sub = torch.from_numpy(sub).float()
+        pb = self.price_basis_lookup[year]
+        yr_match = self.yearly_macro_data["year"].astype(str) == str(year)
+        macro = self.yearly_macro_data.loc[yr_match, self.macro_features].values[0]
+        return {
+            "images": sub,
+            "macro": torch.tensor(macro, dtype=torch.float32),
+            "price_basis": torch.tensor([pb], dtype=torch.float32),
             "fips": fips,
             "year": year,
         }
