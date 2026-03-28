@@ -1,0 +1,12 @@
+{
+  "macro_features": [
+    "crude_oil_usd",
+    "usd_index",
+    "fed_funds_rate",
+    "cpi_yoy",
+    "soybean_corn_ratio"
+  ],
+  "macro_input_dim": 5,
+  "crop": "soybean",
+  "use_temporal": false
+}
