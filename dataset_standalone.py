@@ -16,6 +16,97 @@ import pandas as pd
 from datetime import datetime
 from torch.utils.data import Dataset
 
+# National monthly CSV may use alternate column names (e.g. df_raw.csv).
+MACRO_COLUMN_ALIASES = {
+    "soybean_corn_ratio": ("soybean_corn_ratio", "soy_corn_ratio"),
+}
+
+
+def _ensure_macro_columns(df: pd.DataFrame, macro_features: list) -> pd.DataFrame:
+    df = df.copy()
+    for feat in macro_features:
+        if feat in df.columns:
+            continue
+        for alias in MACRO_COLUMN_ALIASES.get(feat, ()):
+            if alias in df.columns:
+                df[feat] = df[alias]
+                break
+        else:
+            raise ValueError(
+                f"Macro CSV missing column {feat!r} (and no known alias). Columns: {list(df.columns)}"
+            )
+    return df
+
+
+def build_national_monthly_macro_lookup(csv_path: str, macro_features: list) -> dict:
+    """
+    Build lookup (year_str, month_int) -> float32 vector (M,) in macro_features order.
+    Per-column NaNs are forward-filled then back-filled in time order.
+    """
+    df = pd.read_csv(csv_path)
+    if "date" not in df.columns:
+        raise ValueError(f"National monthly CSV must have 'date' column: {csv_path}")
+    df = _ensure_macro_columns(df, macro_features)
+    df["_dt"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["_dt"]).sort_values("_dt")
+    for feat in macro_features:
+        df[feat] = pd.to_numeric(df[feat], errors="coerce")
+    df[macro_features] = df[macro_features].ffill().bfill()
+    lookup = {}
+    for _, row in df.iterrows():
+        y = int(row["_dt"].year)
+        m = int(row["_dt"].month)
+        vec = row[list(macro_features)].values.astype(np.float32)
+        lookup[(str(y), m)] = vec
+    return lookup
+
+
+def _parse_image_date_for_macro(s) -> tuple | None:
+    if isinstance(s, bytes):
+        s = s.decode("utf-8", errors="replace")
+    s = str(s).strip()[:10]
+    if len(s) < 10:
+        return None
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d")
+        return (dt.year, dt.month)
+    except ValueError:
+        return None
+
+
+def macro_sequence_for_dates(
+    year_str: str,
+    dates: list,
+    macro_features: list,
+    monthly_lookup: dict,
+    macro_dim: int,
+) -> np.ndarray:
+    """
+    (T, M) national monthly macro aligned to each satellite date's calendar month.
+    """
+    ys = str(int(year_str))
+    default = monthly_lookup.get((ys, 6))
+    if default is None:
+        for m in range(1, 13):
+            if (ys, m) in monthly_lookup:
+                default = monthly_lookup[(ys, m)]
+                break
+    if default is None:
+        default = np.zeros(macro_dim, dtype=np.float32)
+    rows = []
+    for d in dates:
+        parsed = _parse_image_date_for_macro(d)
+        if parsed is None:
+            vec = default
+        else:
+            yy, mm = parsed
+            key = (str(yy), mm)
+            vec = monthly_lookup.get(key)
+            if vec is None:
+                vec = monthly_lookup.get((ys, mm), default)
+        rows.append(vec.astype(np.float32))
+    return np.stack(rows, axis=0)
+
 
 def augment_temporal_images(images, p_flip=0.5, brightness_scale=(0.85, 1.15), brightness_shift=(-0.08, 0.08)):
     """Same as dataset.py: random flip + brightness, applied to (T,C,H,W)."""
@@ -152,7 +243,9 @@ class StandaloneCropYieldDataset(Dataset):
     def __init__(
         self, root_dir, yields_csv_name="yields.csv", image_subdir="images", 
         macro_data_csv_name="macro_data.csv", macro_features=["crude_oil_usd", "usd_index", "fed_funds_rate", "cpi_yoy", "soybean_corn_ratio"], crop_type="soybean", 
-        transform=None
+        transform=None,
+        use_monthly_national_macro=False,
+        national_monthly_csv_path=None,
     ):
         """
         Args:
@@ -163,6 +256,10 @@ class StandaloneCropYieldDataset(Dataset):
             macro_features: list of macro features to use
             crop_type: "soybean" or "corn" (crop price to predict)
             transform: optional callable (not used by default; use AugmentWrapperStandalone for train)
+            use_monthly_national_macro: If True, __getitem__ returns macro (T, M) from the monthly CSV
+                aligned to each satellite date (yearly price_basis still aggregated from macro_data_csv_name).
+            national_monthly_csv_path: CSV with columns date + macro_features (aliases allowed). If None and
+                use_monthly_national_macro, uses root_dir/macro_data_csv_name (typically standalone_data/macro_data.csv).
         """
         self.root_dir = os.path.abspath(root_dir)
         self.image_subdir = image_subdir
@@ -170,6 +267,15 @@ class StandaloneCropYieldDataset(Dataset):
         self.macro_features = macro_features
         self.crop_type = crop_type
         self.transform = transform
+        self.use_monthly_national_macro = bool(use_monthly_national_macro)
+        self.monthly_macro_lookup = None
+        if self.use_monthly_national_macro:
+            mp = national_monthly_csv_path or os.path.join(self.root_dir, self.macro_data_csv_name)
+            mp = os.path.abspath(mp)
+            if not os.path.isfile(mp):
+                raise FileNotFoundError(f"National monthly macro CSV not found: {mp}")
+            self.monthly_macro_lookup = build_national_monthly_macro_lookup(mp, list(self.macro_features))
+            self._national_monthly_csv_resolved = mp
 
         # read in yield_bu_per_acre - yearly yield for each fips
         yield_csv_path = os.path.join(self.root_dir, yields_csv_name)
@@ -268,10 +374,21 @@ class StandaloneCropYieldDataset(Dataset):
         images, dates = load_sample_images(self.root_dir, fips, year, image_subdir=self.image_subdir)
         y = self.yield_lookup[(fips, year)]
         pb = self.price_basis_lookup[year]
-        macro = self.yearly_macro_data.loc[self.yearly_macro_data["year"] == year, self.macro_features].values[0]
+        if self.use_monthly_national_macro:
+            macro_arr = macro_sequence_for_dates(
+                year,
+                dates,
+                self.macro_features,
+                self.monthly_macro_lookup,
+                len(self.macro_features),
+            )
+            macro = torch.from_numpy(macro_arr).float()
+        else:
+            macro = self.yearly_macro_data.loc[self.yearly_macro_data["year"] == year, self.macro_features].values[0]
+            macro = torch.tensor(macro, dtype=torch.float32)
         return {
             "images": images,
-            "macro": torch.tensor(macro, dtype=torch.float32),
+            "macro": macro,
             "yield": torch.tensor([y], dtype=torch.float32),
             "price_basis": torch.tensor([pb], dtype=torch.float32),
             "fips": fips,

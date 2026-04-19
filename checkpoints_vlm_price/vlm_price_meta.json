@@ -8,5 +8,12 @@
   ],
   "macro_input_dim": 5,
   "crop": "soybean",
-  "use_temporal": false
+  "use_temporal": false,
+  "split_by_year": true,
+  "val_years": [
+    "2024",
+    "2025"
+  ],
+  "val_year_fraction": 0.2,
+  "split_seed": null
 }

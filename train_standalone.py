@@ -1,18 +1,29 @@
 """
 Train on standalone data (no cropnet). Optionally normalize targets to reduce mean collapse.
+Uses CropPriceModel (images + macro -> annual price_basis). County yield in CSV is still annual.
+
+Optional --monthly-national-macro: build (T, M) from the same monthly table as training
+(`{data-dir}/macro_data.csv` by default), aligned to each satellite date. Some columns move
+little month-to-month; we still inject the full monthly row so the temporal branch can use it.
+County yield / annual price_basis labels are unchanged. Note: yield_bu_acre in that CSV is the
+US annual figure repeated each month, not a within-year yield trajectory.
+
 Usage:
   python train_standalone.py --data-dir ./standalone_data [--normalize-target] [--epochs 30] [--checkpoint-dir ./checkpoints_standalone]
+  python train_standalone.py ... --monthly-national-macro
+  # optional override: --national-monthly-csv /path/to/other_monthly.csv
 """
 import argparse
 import os
 import json
+import random
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 import numpy as np
 import pandas as pd
 
@@ -62,8 +73,20 @@ def collate_crop_price(batch):
         padded.append(im)
     images = torch.stack(padded, dim=0) # build batch tensor of shape (batch_size, max_T, C, H, W)
 
-    # macro data
-    macro = torch.stack([b["macro"] for b in batch], dim=0)
+    # macro: (M,) yearly or (T, M) monthly aligned to frames — pad monthly to max_T like images
+    macro_list = [b["macro"] for b in batch]
+    if macro_list[0].dim() == 1:
+        macro = torch.stack(macro_list, dim=0)
+    else:
+        M = macro_list[0].shape[1]
+        macro_pad = []
+        for m in macro_list:
+            Tm = m.shape[0]
+            if Tm < max_T:
+                pad = torch.zeros(max_T - Tm, M, dtype=m.dtype, device=m.device)
+                m = torch.cat([m, pad], dim=0)
+            macro_pad.append(m)
+        macro = torch.stack(macro_pad, dim=0)
 
     # target crop price basis
     price_basis = torch.cat([b["price_basis"] for b in batch], dim=0)
@@ -90,11 +113,65 @@ def main():
     parser.add_argument("--macro-features", nargs="+", default=["crude_oil_usd", "usd_index", "fed_funds_rate", "cpi_yoy", "soybean_corn_ratio"], help="Subset of macro features to use. E.g. --macro-features crude_oil_usd usd_index fed_funds_rate cpi_yoy soybean_corn_ratio")
     parser.add_argument("--crop", choices=["soybean", "corn"], help="Crop to model (default: soybean)", default="soybean")
     parser.add_argument("--image-subdir", default="images", help="Subdir under data-dir for H5/npy")
+    parser.add_argument(
+        "--monthly-national-macro",
+        action="store_true",
+        help="Use monthly macro rows from data-dir (default: same file as --macro-data-csv, usually macro_data.csv) aligned per frame (T, M) instead of one yearly pooled (M,) vector.",
+    )
+    parser.add_argument(
+        "--national-monthly-csv",
+        default=None,
+        help="Optional alternate monthly CSV (date + macro_features). If omitted with --monthly-national-macro, uses {data-dir}/{macro-data-csv} e.g. standalone_data/macro_data.csv.",
+    )
+    # Hyperparameters (override Config defaults) — exposed for grid search
+    parser.add_argument("--lr", type=float, default=None, help="Override config.LEARNING_RATE")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override config.BATCH_SIZE")
+    parser.add_argument("--dropout", type=float, default=None, help="Override config.DROPOUT (affects temporal encoder, macro encoder, head)")
+    parser.add_argument("--temporal-layers", type=int, default=None, help="Override config.TEMPORAL_LAYERS")
+    parser.add_argument("--temporal-heads", type=int, default=None, help="Override config.TEMPORAL_HEADS")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Adam weight decay (default 0.0)")
+    parser.add_argument(
+        "--split-by-year",
+        action="store_true",
+        help="Put entire calendar years in train or val (avoids same price_basis target in both splits).",
+    )
+    parser.add_argument(
+        "--val-year-fraction",
+        type=float,
+        default=0.2,
+        help="With --split-by-year: fraction of distinct years assigned to validation (default 0.2).",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=None,
+        help="With --split-by-year: if set, shuffle years with this seed before taking val years; "
+        "if omitted, use chronologically last years as val. Also seeds torch/numpy/random for reproducibility.",
+    )
     args = parser.parse_args()
 
     config = Config()
+    config.MONTHLY_NATIONAL_MACRO = bool(args.monthly_national_macro)
     if args.epochs is not None:
         config.EPOCHS = args.epochs
+    if args.lr is not None:
+        config.LEARNING_RATE = args.lr
+    if args.batch_size is not None:
+        config.BATCH_SIZE = args.batch_size
+    if args.dropout is not None:
+        config.DROPOUT = args.dropout
+    if args.temporal_layers is not None:
+        config.TEMPORAL_LAYERS = args.temporal_layers
+    if args.temporal_heads is not None:
+        config.TEMPORAL_HEADS = args.temporal_heads
+
+    # Seed for reproducibility when a split seed is provided (so the random_split path is also deterministic)
+    if args.split_seed is not None:
+        random.seed(args.split_seed)
+        np.random.seed(args.split_seed)
+        torch.manual_seed(args.split_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.split_seed)
 
     if len(args.macro_features) != config.MACRO_INPUT_DIM:
         config.MACRO_INPUT_DIM = len(args.macro_features)
@@ -105,13 +182,21 @@ def main():
     print(f"Using device: {device}")
 
     # initialize the datasets
+    national_csv = None
+    if args.monthly_national_macro:
+        national_csv = args.national_monthly_csv
+        if national_csv is not None:
+            national_csv = os.path.abspath(national_csv)
+
     full_dataset = StandaloneCropYieldDataset(
         root_dir=args.data_dir,
         yields_csv_name=args.yields_csv,
         macro_data_csv_name=args.macro_data_csv,
         macro_features=args.macro_features,
         image_subdir=args.image_subdir,
-        crop_type=args.crop
+        crop_type=args.crop,
+        use_monthly_national_macro=args.monthly_national_macro,
+        national_monthly_csv_path=national_csv,
     )
     if len(full_dataset) == 0:
         raise SystemExit("No samples in standalone dataset. Check data_dir and yields.csv / macro_data.csv / images/.")
@@ -138,10 +223,38 @@ def main():
             price_basis_std = 1.0
         print(f"Target normalization: yield mean={yield_mean:.2f}, yield std={yield_std:.2f}, price basis mean={price_basis_mean:.2f}, price basis std={price_basis_std:.2f}")
 
-    # assume 80-20 train-val split
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    # Split: either by-year (clean target separation) or random 80/20
+    val_years_list = None
+    train_years_list = None
+    if args.split_by_year:
+        year_strs = sorted({str(s["year"]) for s in full_dataset.samples}, key=lambda y: int(y))
+        n_y = len(year_strs)
+        if n_y < 2:
+            raise SystemExit("--split-by-year needs at least two distinct years in the dataset.")
+        n_val = max(1, int(round(n_y * args.val_year_fraction)))
+        n_val = min(n_val, n_y - 1)
+        if args.split_seed is not None:
+            rng = random.Random(args.split_seed)
+            shuffled = year_strs[:]
+            rng.shuffle(shuffled)
+            val_year_set = set(shuffled[:n_val])
+        else:
+            val_year_set = set(year_strs[-n_val:])
+        train_indices = [i for i, s in enumerate(full_dataset.samples) if s["year"] not in val_year_set]
+        val_indices = [i for i, s in enumerate(full_dataset.samples) if s["year"] in val_year_set]
+        train_dataset = Subset(full_dataset, train_indices)
+        val_dataset = Subset(full_dataset, val_indices)
+        val_years_list = sorted(val_year_set, key=int)
+        train_years_list = sorted(set(year_strs) - val_year_set, key=int)
+        print(
+            f"[split-by-year] train years ({len(train_years_list)}): {train_years_list} | "
+            f"val years ({len(val_years_list)}): {val_years_list} | "
+            f"samples train={len(train_dataset)} val={len(val_dataset)}"
+        )
+    else:
+        train_size = int(0.8 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
     train_dataset = AugmentWrapperStandalone(train_dataset, augment_fn=augment_temporal_images)
 
     train_loader = DataLoader(
@@ -153,9 +266,48 @@ def main():
 
     model = CropPriceModel(config).to(device)
     criterion = nn.MSELoss() # loss function: mean squared error between predicted yield and actual yield
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE) # Adam optimizer with learning rate from config
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=config.LEARNING_RATE,
+        weight_decay=args.weight_decay,
+    )
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    train_meta = {
+        "monthly_national_macro": bool(args.monthly_national_macro),
+        "national_monthly_csv": (
+            os.path.basename(getattr(full_dataset, "_national_monthly_csv_resolved", "") or "")
+            if args.monthly_national_macro
+            else None
+        ),
+        "national_monthly_csv_abspath": (
+            getattr(full_dataset, "_national_monthly_csv_resolved", None) if args.monthly_national_macro else None
+        ),
+        "macro_features": list(args.macro_features),
+        "crop": args.crop,
+        "macro_data_csv": args.macro_data_csv,
+        # Hyperparameters actually used (post-override)
+        "hyperparams": {
+            "lr": float(config.LEARNING_RATE),
+            "batch_size": int(config.BATCH_SIZE),
+            "dropout": float(config.DROPOUT),
+            "temporal_layers": int(config.TEMPORAL_LAYERS),
+            "temporal_heads": int(config.TEMPORAL_HEADS),
+            "epochs": int(config.EPOCHS),
+            "weight_decay": float(args.weight_decay),
+            "visual_backbone": str(config.VISUAL_BACKBONE),
+            "hidden_dim": int(config.HIDDEN_DIM),
+            "macro_input_dim": int(config.MACRO_INPUT_DIM),
+            "normalize_target": bool(args.normalize_target),
+        },
+        "split_by_year": bool(args.split_by_year),
+        "val_year_fraction": float(args.val_year_fraction) if args.split_by_year else None,
+        "split_seed": args.split_seed,
+        "val_years": val_years_list,
+        "train_years": train_years_list,
+    }
+    with open(os.path.join(args.checkpoint_dir, "standalone_train_meta.json"), "w") as f:
+        json.dump(train_meta, f, indent=2)
     if yield_mean is not None:
         with open(os.path.join(args.checkpoint_dir, "yield_norm.json"), "w") as f:
             json.dump({"mean": yield_mean, "std": yield_std}, f)

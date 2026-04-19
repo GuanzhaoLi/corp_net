@@ -3,6 +3,10 @@ Predict using standalone data layout (must match train_standalone.py).
 train_standalone.py trains CropPriceModel (images + macro -> price basis). This script
 loads the same architecture and macro features per year.
 
+If standalone_train_meta.json next to the checkpoint sets monthly_national_macro, this script
+loads monthly (T, M) macro aligned to satellite dates (same as training). Override with
+--force-yearly-macro or --national-monthly-csv.
+
 Usage:
   python predict_standalone.py --data-dir ./standalone_data \\
     --checkpoint ./checkpoints_standalone/model_best.pth --out predictions.csv \\
@@ -17,8 +21,37 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 import torch
 
 from config import Config
-from dataset_standalone import load_sample_images, load_macro_vector_for_year
+from dataset_standalone import (
+    load_sample_images,
+    load_macro_vector_for_year,
+    build_national_monthly_macro_lookup,
+    macro_sequence_for_dates,
+)
 from model import CropPriceModel
+
+
+def _resolve_national_monthly_csv(data_dir, ckpt_dir, meta, user_override):
+    if user_override:
+        p = os.path.abspath(user_override)
+        if os.path.isfile(p):
+            return p
+        raise FileNotFoundError(f"--national-monthly-csv not found: {p}")
+    abspath_saved = (meta or {}).get("national_monthly_csv_abspath")
+    if abspath_saved and os.path.isfile(abspath_saved):
+        return abspath_saved
+    name = (meta or {}).get("national_monthly_csv")
+    if name:
+        base = os.path.basename(name)
+        for root in (data_dir, ckpt_dir, os.path.dirname(os.path.abspath(__file__))):
+            cand = os.path.join(os.path.abspath(root), base)
+            if os.path.isfile(cand):
+                return cand
+    cand = os.path.join(os.path.abspath(data_dir), "macro_data.csv")
+    if os.path.isfile(cand):
+        return cand
+    raise FileNotFoundError(
+        "National monthly macro CSV not found. Pass --national-monthly-csv or place the file in data-dir."
+    )
 
 
 def main():
@@ -38,6 +71,16 @@ def main():
     parser.add_argument("--out", default="predictions_standalone.csv")
     parser.add_argument("--fips", nargs="+", default=None, help="FIPS to predict (default: all that have images)")
     parser.add_argument("--years", nargs="+", default=None, help="Years (default: all that have images)")
+    parser.add_argument(
+        "--national-monthly-csv",
+        default=None,
+        help="National monthly macro CSV (for monthly training); auto from standalone_train_meta.json if omitted",
+    )
+    parser.add_argument(
+        "--force-yearly-macro",
+        action="store_true",
+        help="Use yearly (M,) macro even if checkpoint meta says monthly (will fail if weights expect monthly).",
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.checkpoint):
@@ -62,9 +105,24 @@ def main():
     if len(args.macro_features) != config.MACRO_INPUT_DIM:
         config.MACRO_INPUT_DIM = len(args.macro_features)
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+
+    meta_path = os.path.join(ckpt_dir, "standalone_train_meta.json")
+    train_meta = {}
+    if os.path.isfile(meta_path):
+        with open(meta_path) as f:
+            train_meta = json.load(f)
+    monthly = bool(train_meta.get("monthly_national_macro")) and not args.force_yearly_macro
+    config.MONTHLY_NATIONAL_MACRO = monthly
+
     model = CropPriceModel(config).to(device)
     model.load_state_dict(torch.load(args.checkpoint, map_location=device), strict=True)
     model.eval()
+
+    monthly_lookup = None
+    if monthly:
+        csv_path = _resolve_national_monthly_csv(args.data_dir, ckpt_dir, train_meta, args.national_monthly_csv)
+        monthly_lookup = build_national_monthly_macro_lookup(csv_path, list(args.macro_features))
+        print(f"Monthly national macro from {csv_path} (T, M) aligned to satellite dates")
 
     base = os.path.join(args.data_dir, "images")
     if not os.path.isdir(base):
@@ -82,18 +140,28 @@ def main():
     rows = []
     for fips, year in pairs:
         try:
-            images, _ = load_sample_images(args.data_dir, fips, year, image_subdir="images")
+            images, dates = load_sample_images(args.data_dir, fips, year, image_subdir="images")
         except FileNotFoundError:
             continue
         images = images.unsqueeze(0)
         lengths = torch.tensor([images.shape[1]], dtype=torch.long)
-        macro = load_macro_vector_for_year(
-            args.data_dir,
-            year,
-            args.macro_features,
-            macro_data_csv_name=args.macro_data_csv,
-            crop_type=args.crop,
-        ).unsqueeze(0)
+        if monthly and monthly_lookup is not None:
+            arr = macro_sequence_for_dates(
+                year,
+                dates,
+                args.macro_features,
+                monthly_lookup,
+                len(args.macro_features),
+            )
+            macro = torch.from_numpy(arr).float().unsqueeze(0)
+        else:
+            macro = load_macro_vector_for_year(
+                args.data_dir,
+                year,
+                args.macro_features,
+                macro_data_csv_name=args.macro_data_csv,
+                crop_type=args.crop,
+            ).unsqueeze(0)
         with torch.no_grad():
             pred = model(
                 images=images.to(device),

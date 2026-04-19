@@ -62,6 +62,8 @@ class Config:
 
     # Macroeconomic data parameters
     MACRO_INPUT_DIM = 5  # default macro-features: crude_oil_usd, usd_index, fed_funds_rate, cpi_yoy, soy_corn_ratio
+    # When True, CropPriceModel expects macro_data (B, T, M) aligned to each satellite date (national monthly table).
+    MONTHLY_NATIONAL_MACRO = False
     
     # Training Parameters
     BATCH_SIZE = 4

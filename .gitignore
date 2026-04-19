@@ -30,6 +30,8 @@ checkpoints_vlm/*
 *pth
 checkpoints_vlm_temporal/*
 history.txt
+*.json
 
 # VSCode settings
 .vscode/
+grid_search_results/sweep.pid

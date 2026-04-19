@@ -167,7 +167,8 @@ class MacroEncoder(nn.Module):
 class CropPriceModel(nn.Module):
     def __init__(self, config):
         super().__init__()
-        
+        self.monthly_national_macro = bool(getattr(config, "MONTHLY_NATIONAL_MACRO", False))
+
         # Visual/Temporal Branch (ViT + Temporal Transformer on satellite image sequence)
         self.visual_encoder = VisualEncoder(
             backbone_name=config.VISUAL_BACKBONE,
@@ -181,6 +182,15 @@ class CropPriceModel(nn.Module):
             nhead=config.TEMPORAL_HEADS,
             dropout=config.DROPOUT
         )
+
+        # Per-frame national macro (monthly row aligned to satellite date) -> same dim as visual tokens
+        if self.monthly_national_macro:
+            self.macro_time_embed = nn.Sequential(
+                nn.Linear(config.MACRO_INPUT_DIM, config.HIDDEN_DIM),
+                nn.LayerNorm(config.HIDDEN_DIM),
+                nn.GELU(),
+                nn.Dropout(config.DROPOUT),
+            )
 
         # Macro Branch
         self.macro_encoder = MacroEncoder(
@@ -207,7 +217,7 @@ class CropPriceModel(nn.Module):
         """
         Args:
             images: (B, T, C, H, W) - Sentinel 2 satellite image sequence
-            macro_data: (B, M) - Yearly aggregated macroeconomic features
+            macro_data: (B, M) yearly macro, or (B, T, M) national monthly macro aligned to each frame
             lengths: (B,) - Actual image sequence lengths for masking
         """
         # x: (B, T, C, H, W). lengths: (B,) actual time steps per sample (optional, for variable T)
@@ -220,19 +230,31 @@ class CropPriceModel(nn.Module):
         visual_feats = self.visual_encoder(images_flat) # (B * T, D)
         # Reshape back to Sequence
         visual_feats = visual_feats.reshape(B, T, -1) # (B, T, D)
-        
+
         # Mask for padded time steps (True = ignore)
         if lengths is not None:
             # lengths: (B,) e.g. [12, 10, 15, 12]; mask[b, t] = True when t >= lengths[b]
             key_padding_mask = torch.arange(T, device=images.device).unsqueeze(0) >= lengths.unsqueeze(1)  # (B, T)
         else:
             key_padding_mask = None
+
+        if macro_data.dim() == 3:
+            if not self.monthly_national_macro:
+                raise ValueError("macro_data is (B, T, M) but config.MONTHLY_NATIONAL_MACRO is False")
+            macro_emb = self.macro_time_embed(macro_data)
+            visual_feats = visual_feats + macro_emb
+            if lengths is not None:
+                valid = ~key_padding_mask
+                denom = valid.sum(dim=1, keepdim=True).to(macro_data.dtype).clamp(min=1.0)
+                macro_pooled = (macro_data * valid.unsqueeze(-1)).sum(dim=1) / denom
+            else:
+                macro_pooled = macro_data.mean(dim=1)
+            macro_vec = self.macro_encoder(macro_pooled)
+        else:
+            macro_vec = self.macro_encoder(macro_data)
         
         # Temporal Processing (Temporal Transformer)
         context_vec = self.temporal_encoder(visual_feats, key_padding_mask=key_padding_mask) # (B, D)
-
-        # Macro Branch
-        macro_vec = self.macro_encoder(macro_data) # (B, D)
 
         # Gated Fusion Layer
         # Concatenate all features
